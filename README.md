@@ -1,0 +1,1 @@
+Датасет: https://www.kaggle.com/datasets/solarmainframe/ids-intrusion-csv
