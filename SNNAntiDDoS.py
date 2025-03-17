@@ -2,14 +2,15 @@ import os
 import random
 import torch
 import pandas as pd
-import networkx as nx
-import snntorch as snn
-from sklearn.preprocessing import LabelEncoder, MinMaxScaler
+import numpy as np
+from sklearn.preprocessing import MinMaxScaler
 from sklearn.model_selection import train_test_split
+from sklearn.metrics import f1_score
 from torch.utils.data import TensorDataset, DataLoader
 import torch.nn as nn
 import torch.amp as amp
 from tqdm import tqdm
+import snntorch as snn
 
 # Фиксируем seed для воспроизводимости
 def set_seed(seed: int = 42):
@@ -24,104 +25,82 @@ torch.backends.cudnn.benchmark = True
 
 # Гиперпараметры
 config = {
-    "file_path": "DDoS_dataset.csv",  # Убедитесь, что путь к файлу корректный
+    "file_path": "02-14-2018.csv",  # Проверьте корректность пути к файлу
     "batch_size": 4096,
-    "epochs": 100,
+    "epochs": 5,
     "lr": 0.0005,
     "T_max": 100,
     "hidden_dim1": 150,
     "hidden_dim2": 75,
     "seed": 42,
-    "num_workers": 16,
+    "num_workers": 4,  # уменьшено число воркеров для совместимости
 }
-
-def normalize_ip(ip) -> float:
-    """
-    Если ip является строкой и содержит точку, нормализуем его.
-    Иначе пытаемся привести к float.
-    """
-    if isinstance(ip, str) and '.' in ip:
-        parts = list(map(int, ip.split('.')))
-        return sum([p / (256 ** (i + 1)) for i, p in enumerate(parts)])
-    try:
-        return float(ip)
-    except Exception:
-        return 0.0
-
-def denormalize_ip(normalized_ip) -> str:
-    """
-    Если значение меньше 1, считаем, что оно нормализовано и преобразуем обратно в IP-адрес.
-    Если значение уже строковое, возвращаем его как есть.
-    Иначе – возвращаем строковое представление.
-    """
-    if isinstance(normalized_ip, str):
-        return normalized_ip
-    if normalized_ip < 1:
-        ip_float = normalized_ip * (256 ** 4)
-        parts = []
-        for i in range(4):
-            part = int(ip_float // (256 ** (3 - i)))
-            parts.append(str(part))
-            ip_float -= part * (256 ** (3 - i))
-        return ".".join(parts)
-    return str(normalized_ip)
 
 def load_and_preprocess_data(file_path: str):
     # Загрузка датасета
     data = pd.read_csv(file_path)
+    # Очистка заголовков: удаляем пробелы в начале и конце названий столбцов
+    data.columns = data.columns.str.strip()
+    print("Столбцы:", data.columns.tolist())
 
-    # Вывод списка столбцов для проверки
-    # print(data.columns.tolist())
+    # Проверка наличия необходимых колонок
+    if "Label" not in data.columns:
+        raise ValueError("Отсутствует колонка Label (целевая метка)")
 
-    # Проверяем наличие необходимых колонок
-    required_columns = ["Highest Layer", "Transport Layer", "Source IP", "Dest IP",
-                        "Source Port", "Dest Port", "Packet Length", "Packets/Time", "target"]
-    for col in required_columns:
-        if col not in data.columns:
-            raise ValueError(f"Отсутствует колонка {col}")
+    # Выводим распределение классов (до обработки)
+    print("Распределение классов (до обработки):")
+    print(data["Label"].value_counts())
 
-    # Кодирование категориальных признаков
-    for col in ["Highest Layer", "Transport Layer"]:
-        le = LabelEncoder()
-        data[col] = le.fit_transform(data[col])
+    # Перекодировка меток: Benign → 0, остальные → 1
+    data["Label"] = data["Label"].apply(lambda x: 0 if x == "Benign" else 1)
 
-    # Приведение IP-адресов к числовому виду
-    data["Source IP"] = data["Source IP"].apply(normalize_ip)
-    data["Dest IP"] = data["Dest IP"].apply(normalize_ip)
+    # Сохраняем оригинальные значения для последующей денормализации iptables правил
+    original_ports = data["Dst Port"].copy() if "Dst Port" in data.columns else None
+    original_protocols = data["Protocol"].copy() if "Protocol" in data.columns else None
+
+    # Если в датасете присутствует столбец Timestamp, его можно отбросить или использовать для создания дополнительных признаков
+    if "Timestamp" in data.columns:
+        data = data.drop(columns=["Timestamp"])
+
+    # Кодирование категориальных признаков: например, "Protocol"
+    if "Protocol" in data.columns:
+        if not pd.api.types.is_numeric_dtype(data["Protocol"]):
+            data["Protocol"] = data["Protocol"].astype("category").cat.codes
+
+    # Замена бесконечных значений на NaN и удаление строк с пропущенными значениями
+    data.replace([np.inf, -np.inf], np.nan, inplace=True)
+    data.dropna(inplace=True)
+    # Сброс индексов, чтобы индексы были последовательными
+    data.reset_index(drop=True, inplace=True)
+    if original_ports is not None:
+        original_ports = original_ports.loc[data.index]
+    if original_protocols is not None:
+        original_protocols = original_protocols.loc[data.index]
+
+    # Определяем список признаков: исключаем целевую метку
+    features = [col for col in data.columns if col != "Label"]
+
+    # Приведение числовых признаков к корректному типу (если необходимо)
+    data[features] = data[features].apply(pd.to_numeric, errors='coerce')
 
     # Нормализация числовых признаков
     scaler = MinMaxScaler()
-    num_columns = ["Source Port", "Dest Port", "Packet Length", "Packets/Time"]
-    data[num_columns] = scaler.fit_transform(data[num_columns])
+    data[features] = scaler.fit_transform(data[features])
 
-    # Построение графа для вычисления степеней узлов по IP-адресам
-    G = nx.DiGraph()
-    unique_ips = pd.concat([data["Source IP"], data["Dest IP"]]).unique()
-    G.add_nodes_from(unique_ips)
-    for idx, row in data.iterrows():
-        G.add_edge(row["Source IP"], row["Dest IP"])
-    in_degs = dict(G.in_degree())
-    out_degs = dict(G.out_degree())
-    data["in_degree"] = data["Source IP"].apply(lambda ip: in_degs.get(ip, 0))
-    data["out_degree"] = data["Source IP"].apply(lambda ip: out_degs.get(ip, 0))
-    deg_scaler = MinMaxScaler()
-    data[["in_degree", "out_degree"]] = deg_scaler.fit_transform(data[["in_degree", "out_degree"]])
-
-    # Формируем список признаков для модели
-    features = [
-        "Highest Layer", "Transport Layer", "Source IP", "Dest IP",
-        "Source Port", "Dest Port", "Packet Length", "Packets/Time",
-        "in_degree", "out_degree"
-    ]
-
+    # Формирование входных данных и меток
     X = torch.tensor(data[features].values, dtype=torch.float32)
-    y = torch.tensor(data["target"].values, dtype=torch.float32)
+    y = torch.tensor(data["Label"].values, dtype=torch.float32)
 
     X_train, X_test, y_train, y_test, train_idx, test_idx = train_test_split(
         X, y, data.index, test_size=0.2, random_state=config["seed"]
     )
-    return X_train, X_test, y_train, y_test, data, features, train_idx, test_idx
+    # Также возвращаем оригинальные значения для тестового набора
+    if original_ports is not None:
+        original_ports = original_ports.iloc[test_idx]
+    if original_protocols is not None:
+        original_protocols = original_protocols.iloc[test_idx]
 
+    return X_train, X_test, y_train, y_test, data, features, train_idx, test_idx, original_ports, original_protocols
 
 # Оптимизированная модель с использованием SNN
 class ModifiedTrafficSNN(nn.Module):
@@ -159,18 +138,22 @@ class ModifiedTrafficSNN(nn.Module):
         out = self.fc3(spk2)
         return out
 
-def generate_iptables_rules(model, X_data, original_data):
+def generate_iptables_rules(model, X_data, orig_ports, orig_protocols):
+    """
+    Генерация iptables правил на основе предсказаний модели.
+    Для каждого примера используются денормализованные значения 'Dst Port' и 'Protocol'.
+    """
     model.eval()
     rules = []
     with torch.no_grad():
         out = model(X_data)
         preds = (torch.sigmoid(out).squeeze() > 0.5).float().cpu().numpy()
     for i, pred in enumerate(preds):
-        idx = original_data.index[i]
-        src_ip = denormalize_ip(original_data.loc[idx, "Source IP"])
-        dst_ip = denormalize_ip(original_data.loc[idx, "Dest IP"])
+        # Берём оригинальные значения для iptables правила
+        dst_port = orig_ports.iloc[i] if orig_ports is not None else "N/A"
+        protocol = orig_protocols.iloc[i] if orig_protocols is not None else "N/A"
         action = "ACCEPT" if pred == 1 else "DROP"
-        rule = f"iptables -A INPUT -s {src_ip} -d {dst_ip} -j {action}"
+        rule = f"iptables -A INPUT -p {protocol} --dport {dst_port} -j {action}"
         rules.append(rule)
     return rules
 
@@ -183,7 +166,8 @@ class WarmUpLR(torch.optim.lr_scheduler._LRScheduler):
     def get_lr(self):
         return [base_lr * (self.last_epoch + 1) / self.warmup_epochs for base_lr in self.base_lrs]
 
-def train_snn_fn(model, loader, optimizer, scheduler, warmup_scheduler, criterion, scaler, device, epochs, warmup_epochs):
+def train_snn_fn(model, loader, optimizer, scheduler, warmup_scheduler, criterion, scaler, device, epochs,
+                 warmup_epochs):
     model.train()
     for epoch in range(epochs):
         total_loss = 0.0
@@ -205,19 +189,19 @@ def train_snn_fn(model, loader, optimizer, scheduler, warmup_scheduler, criterio
             warmup_scheduler.step()
         else:
             scheduler.step()
-        if (epoch + 1) % 10 == 0:
-            avg_loss = total_loss / len(loader)
-            print(f"Epoch {epoch + 1}/{epochs}, Avg Loss: {avg_loss:.4f}")
+        print(f"Epoch {epoch + 1}/{epochs}, Avg Loss: {total_loss / len(loader):.4f}")
 
 def main():
-    X_train, X_test, y_train, y_test, data, features, train_idx, test_idx = load_and_preprocess_data(config["file_path"])
+    X_train, X_test, y_train, y_test, data, features, train_idx, test_idx, orig_ports, orig_protocols = load_and_preprocess_data(
+        config["file_path"]
+    )
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print("Используемое устройство:", device)
 
     # Подготовка DataLoader
     train_dataset = TensorDataset(X_train, y_train)
     train_loader = DataLoader(train_dataset, batch_size=config["batch_size"], shuffle=True,
-                              num_workers=config["num_workers"], pin_memory=True, persistent_workers=True)
+                              num_workers=config["num_workers"], pin_memory=True)
 
     input_dim = len(features)
     model = ModifiedTrafficSNN(input_dim, config["hidden_dim1"], config["hidden_dim2"], output_dim=1).to(device)
@@ -240,9 +224,12 @@ def main():
         test_out = model(X_test)
         preds = (torch.sigmoid(test_out).squeeze() > 0.5).float()
         accuracy = (preds == y_test).sum().item() / y_test.size(0)
+        f1 = f1_score(y_test.cpu().numpy(), preds.cpu().numpy(), average="binary")
         print(f"Test Accuracy: {accuracy:.2f}")
+        print(f"Test F1-score: {f1:.2f}")
 
-    rules = generate_iptables_rules(model, X_test, data.iloc[test_idx])
+    # Генерация правил iptables с денормализованными значениями
+    rules = generate_iptables_rules(model, X_test, orig_ports, orig_protocols)
     print("\nПример правил iptables:")
     for r in rules[:5]:
         print(r)
